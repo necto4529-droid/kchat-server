@@ -1,77 +1,10 @@
 const WebSocket = require('ws');
-const Database = require('better-sqlite3');
-const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
 
-// --- База данных на постоянном диске Render ---
-const dbPath = path.join('/opt/render/project/data', 'offline.db');
-const db = new Database(dbPath);
-
-// Создаём таблицу для хранения офлайн-сообщений
-db.exec(`
-  CREATE TABLE IF NOT EXISTS offline_queue (
-    msg_id TEXT PRIMARY KEY,
-    recipient_id TEXT NOT NULL,
-    sender_id TEXT NOT NULL,
-    payload TEXT NOT NULL,          -- JSON-строка с зашифрованными данными
-    type TEXT DEFAULT 'msg',        -- 'msg' или 'voice-listened'
-    timestamp INTEGER NOT NULL,
-    expires_at INTEGER               -- когда истекает (NULL = никогда)
-  );
-  CREATE INDEX IF NOT EXISTS idx_offline_recipient ON offline_queue (recipient_id);
-  CREATE INDEX IF NOT EXISTS idx_offline_expires ON offline_queue (expires_at);
-`);
-
-// Автоудаление старых сообщений (14 дней)
-const AUTO_DELETE_DAYS = 14;
-function cleanupExpired() {
-  if (AUTO_DELETE_DAYS <= 0) return;
-  const stmt = db.prepare('DELETE FROM offline_queue WHERE expires_at IS NOT NULL AND expires_at < ?');
-  const info = stmt.run(Date.now());
-  if (info.changes > 0) console.log(`🧹 Удалено ${info.changes} старых офлайн-сообщений.`);
-}
-cleanupExpired();
-setInterval(cleanupExpired, 60 * 60 * 1000); // раз в час
-
-// --- Функции для работы с очередью ---
-function saveOfflineMessage(msgId, recipient, sender, payload, type = 'msg') {
-  const timestamp = Date.now();
-  const expires = AUTO_DELETE_DAYS > 0 ? timestamp + (AUTO_DELETE_DAYS * 24 * 60 * 60 * 1000) : null;
-  const stmt = db.prepare(`
-    INSERT OR REPLACE INTO offline_queue
-    (msg_id, recipient_id, sender_id, payload, type, timestamp, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-  stmt.run(msgId, recipient, sender, JSON.stringify(payload), type, timestamp, expires);
-}
-
-function getAndClearOfflineMessages(recipient) {
-  const now = Date.now();
-  const stmt = db.prepare(`
-    SELECT * FROM offline_queue
-    WHERE recipient_id = ?
-      AND (expires_at IS NULL OR expires_at > ?)
-    ORDER BY timestamp ASC
-  `);
-  const rows = stmt.all(recipient, now);
-  if (rows.length === 0) return [];
-
-  // Удаляем эти сообщения из очереди
-  const deleteStmt = db.prepare('DELETE FROM offline_queue WHERE recipient_id = ? AND (expires_at IS NULL OR expires_at > ?)');
-  deleteStmt.run(recipient, now);
-
-  return rows.map(r => ({
-    msgId: r.msg_id,
-    from: r.sender_id,
-    payload: r.type === 'msg' ? JSON.parse(r.payload) : null,
-    type: r.type,
-    voiceMsgId: r.type === 'voice-listened' ? JSON.parse(r.payload).voiceMsgId : null
-  }));
-}
-
-function markDelivered(msgId) {
-  // В этой архитектуре сообщение удаляется из очереди при доставке,
-  // так что отдельно помечать не нужно.
-}
+// --- Supabase клиент ---
+const SUPABASE_URL = 'https://lnrrnhpzudcsyjijbjrh.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_Q-1rp2b2aWmw5TpNC7Lw7Q_luaAVrUY';
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // --- WebSocket сервер ---
 const wss = new WebSocket.Server({ port: process.env.PORT || 8080 });
@@ -93,7 +26,7 @@ function broadcastPresence(peerId, isOnline) {
 wss.on('connection', (ws) => {
   let userId = null;
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
@@ -108,23 +41,36 @@ wss.on('connection', (ws) => {
       send(ws, { type: 'registered' });
       broadcastPresence(userId, true);
 
-      // Доставляем все накопленные офлайн-сообщения
-      const pending = getAndClearOfflineMessages(userId);
-      if (pending.length > 0) {
+      // Доставляем все накопленные офлайн-сообщения из Supabase
+      const now = Date.now();
+      const { data: pending, error } = await supabase
+        .from('offline_queue')
+        .select('*')
+        .eq('recipient_id', userId)
+        .or(`expires_at.is.null,expires_at.gt.${now}`)
+        .order('timestamp', { ascending: true });
+
+      if (!error && pending && pending.length > 0) {
         console.log(`[${userId}] delivering ${pending.length} queued items`);
+        
+        // Удаляем доставленные сообщения из очереди
+        const idsToDelete = pending.map(item => item.msg_id);
+        await supabase.from('offline_queue').delete().in('msg_id', idsToDelete);
+
+        // Отправляем сообщения клиенту
         for (const item of pending) {
           if (item.type === 'msg') {
             send(ws, {
               type: 'incoming-msg',
-              from: item.from,
-              msgId: item.msgId,
+              from: item.sender_id,
+              msgId: item.msg_id,
               payload: item.payload
             });
           } else if (item.type === 'voice-listened') {
             send(ws, {
               type: 'voice-listened',
-              from: item.from,
-              voiceMsgId: item.voiceMsgId
+              from: item.sender_id,
+              voiceMsgId: item.payload.voiceMsgId
             });
           }
         }
@@ -132,7 +78,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // --- SEND-MSG (обычное или голосовое) ---
+    // --- SEND-MSG ---
     if (data.type === 'send-msg') {
       if (!userId) return;
       const target = (data.target || '').toLowerCase();
@@ -150,39 +96,68 @@ wss.on('connection', (ws) => {
           payload: payload
         });
         console.log(`[${userId}] → [${target}] live delivery`);
-        // Для не-ephemeral сообщений сохраняем в офлайн-очередь на случай, если ACK не придёт
+        
+        // Сохраняем в БД на случай, если ACK не придёт
         if (!ephemeral) {
-          saveOfflineMessage(msgId, target, userId, payload, 'msg');
+          const timestamp = Date.now();
+          const expires = timestamp + (14 * 24 * 60 * 60 * 1000); // 14 дней
+          await supabase.from('offline_queue').upsert({
+            msg_id: msgId,
+            recipient_id: target,
+            sender_id: userId,
+            payload: payload,
+            type: 'msg',
+            timestamp: timestamp,
+            expires_at: expires
+          });
         }
       } else {
-        // Получатель офлайн – сохраняем в БД
+        // Получатель офлайн – сохраняем в Supabase
         if (!ephemeral) {
-          saveOfflineMessage(msgId, target, userId, payload, 'msg');
-          console.log(`[${userId}] → [${target}] queued (offline)`);
+          const timestamp = Date.now();
+          const expires = timestamp + (14 * 24 * 60 * 60 * 1000); // 14 дней
+          await supabase.from('offline_queue').insert({
+            msg_id: msgId,
+            recipient_id: target,
+            sender_id: userId,
+            payload: payload,
+            type: 'msg',
+            timestamp: timestamp,
+            expires_at: expires
+          });
+          console.log(`[${userId}] → [${target}] queued in Supabase (offline)`);
         }
       }
       return;
     }
 
-    // --- ACK-MSG (подтверждение доставки) ---
+    // --- ACK-MSG ---
     if (data.type === 'ack-msg') {
       if (!userId) return;
       const { msgId } = data;
       if (!msgId) return;
 
       // Удаляем сообщение из очереди, так как получатель подтвердил получение
-      const stmt = db.prepare('DELETE FROM offline_queue WHERE msg_id = ?');
-      stmt.run(msgId);
+      const { error } = await supabase
+        .from('offline_queue')
+        .delete()
+        .eq('msg_id', msgId);
 
-      console.log(`[${userId}] ACK ${msgId}`);
-
-      // Уведомляем отправителя о доставке (если он ещё в сети)
-      // Для этого нам нужно узнать, кто был отправителем. Можно сделать отдельный запрос.
-      const info = db.prepare('SELECT sender_id FROM offline_queue WHERE msg_id = ?').get(msgId);
-      if (info) {
-        const senderWs = clients.get(info.sender_id);
-        if (senderWs) {
-          send(senderWs, { type: 'msg-delivered', msgId, by: userId });
+      if (!error) {
+        console.log(`[${userId}] ACK ${msgId}`);
+        
+        // Уведомляем отправителя о доставке
+        const { data: msgData } = await supabase
+          .from('offline_queue')
+          .select('sender_id')
+          .eq('msg_id', msgId)
+          .maybeSingle();
+          
+        if (msgData) {
+          const senderWs = clients.get(msgData.sender_id);
+          if (senderWs) {
+            send(senderWs, { type: 'msg-delivered', msgId, by: userId });
+          }
         }
       }
       return;
@@ -197,7 +172,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // --- VOICE-LISTENED (relay) ---
+    // --- VOICE-LISTENED ---
     if (data.type === 'voice-listened') {
       if (!userId) return;
       const target = (data.target || '').toLowerCase();
@@ -212,20 +187,24 @@ wss.on('connection', (ws) => {
         });
         console.log(`[${userId}] → [${target}] voice-listened live`);
       } else {
-        // Отправитель офлайн – сохраняем в офлайн-очередь
-        saveOfflineMessage(
-          `vl-${Date.now()}-${userId}-${target}`,
-          target,
-          userId,
-          payload,
-          'voice-listened'
-        );
-        console.log(`[${userId}] → [${target}] voice-listened queued (offline)`);
+        // Отправитель офлайн – сохраняем в Supabase
+        const timestamp = Date.now();
+        const expires = timestamp + (14 * 24 * 60 * 60 * 1000); // 14 дней
+        await supabase.from('offline_queue').insert({
+          msg_id: `vl-${timestamp}-${userId}-${target}`,
+          recipient_id: target,
+          sender_id: userId,
+          payload: payload,
+          type: 'voice-listened',
+          timestamp: timestamp,
+          expires_at: expires
+        });
+        console.log(`[${userId}] → [${target}] voice-listened queued in Supabase (offline)`);
       }
       return;
     }
 
-    // --- Legacy signal (если нужно) ---
+    // --- Legacy signal ---
     if (data.type === 'signal' && data.target) {
       const targetWs = clients.get(data.target.toLowerCase());
       if (targetWs) {
@@ -246,4 +225,4 @@ wss.on('connection', (ws) => {
 });
 
 console.log(`🚀 Сервер запущен на порту ${wss.options.port}`);
-console.log(`⏳ Автоудаление офлайн-сообщений через ${AUTO_DELETE_DAYS} дн.`);
+console.log(`⏳ Автоудаление офлайн-сообщений через 14 дн.`);
