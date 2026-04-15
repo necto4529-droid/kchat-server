@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: kchat-server
+    env: node
+    rootDir: .
+    buildCommand: npm install
+    startCommand: npm start
