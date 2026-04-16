@@ -1,12 +1,11 @@
 const WebSocket = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 
-// --- Supabase клиент ---
+// --- Твои ключи Supabase (уже проверенные) ---
 const SUPABASE_URL = 'https://lnrrnhpzudcsyjijbjrh.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_Q-1rp2b2aWmw5TpNC7Lw7Q_luaAVrUY';
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// --- WebSocket сервер ---
 const wss = new WebSocket.Server({ port: process.env.PORT || 8080 });
 const clients = new Map(); // peerId -> WebSocket
 
@@ -41,7 +40,7 @@ wss.on('connection', (ws) => {
       send(ws, { type: 'registered' });
       broadcastPresence(userId, true);
 
-      // Доставляем все накопленные офлайн-сообщения из Supabase
+      // Доставляем офлайн-сообщения из Supabase
       const now = Date.now();
       const { data: pending, error } = await supabase
         .from('offline_queue')
@@ -52,12 +51,9 @@ wss.on('connection', (ws) => {
 
       if (!error && pending && pending.length > 0) {
         console.log(`[${userId}] delivering ${pending.length} queued items`);
-        
-        // Удаляем доставленные сообщения из очереди
         const idsToDelete = pending.map(item => item.msg_id);
         await supabase.from('offline_queue').delete().in('msg_id', idsToDelete);
 
-        // Отправляем сообщения клиенту
         for (const item of pending) {
           if (item.type === 'msg') {
             send(ws, {
@@ -88,19 +84,11 @@ wss.on('connection', (ws) => {
       const targetWs = clients.get(target);
 
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        // Получатель онлайн – доставляем сразу
-        send(targetWs, {
-          type: 'incoming-msg',
-          from: userId,
-          msgId: msgId,
-          payload: payload
-        });
+        send(targetWs, { type: 'incoming-msg', from: userId, msgId, payload });
         console.log(`[${userId}] → [${target}] live delivery`);
-        
-        // Сохраняем в БД на случай, если ACK не придёт
         if (!ephemeral) {
           const timestamp = Date.now();
-          const expires = timestamp + (14 * 24 * 60 * 60 * 1000); // 14 дней
+          const expires = timestamp + (14 * 24 * 60 * 60 * 1000);
           await supabase.from('offline_queue').upsert({
             msg_id: msgId,
             recipient_id: target,
@@ -112,10 +100,9 @@ wss.on('connection', (ws) => {
           });
         }
       } else {
-        // Получатель офлайн – сохраняем в Supabase
         if (!ephemeral) {
           const timestamp = Date.now();
-          const expires = timestamp + (14 * 24 * 60 * 60 * 1000); // 14 дней
+          const expires = timestamp + (14 * 24 * 60 * 60 * 1000);
           await supabase.from('offline_queue').insert({
             msg_id: msgId,
             recipient_id: target,
@@ -125,7 +112,7 @@ wss.on('connection', (ws) => {
             timestamp: timestamp,
             expires_at: expires
           });
-          console.log(`[${userId}] → [${target}] queued in Supabase (offline)`);
+          console.log(`[${userId}] → [${target}] queued in Supabase`);
         }
       }
       return;
@@ -136,30 +123,8 @@ wss.on('connection', (ws) => {
       if (!userId) return;
       const { msgId } = data;
       if (!msgId) return;
-
-      // Удаляем сообщение из очереди, так как получатель подтвердил получение
-      const { error } = await supabase
-        .from('offline_queue')
-        .delete()
-        .eq('msg_id', msgId);
-
-      if (!error) {
-        console.log(`[${userId}] ACK ${msgId}`);
-        
-        // Уведомляем отправителя о доставке
-        const { data: msgData } = await supabase
-          .from('offline_queue')
-          .select('sender_id')
-          .eq('msg_id', msgId)
-          .maybeSingle();
-          
-        if (msgData) {
-          const senderWs = clients.get(msgData.sender_id);
-          if (senderWs) {
-            send(senderWs, { type: 'msg-delivered', msgId, by: userId });
-          }
-        }
-      }
+      await supabase.from('offline_queue').delete().eq('msg_id', msgId);
+      console.log(`[${userId}] ACK ${msgId}`);
       return;
     }
 
@@ -180,16 +145,11 @@ wss.on('connection', (ws) => {
       const payload = { voiceMsgId: data.voiceMsgId };
 
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        send(targetWs, {
-          type: 'voice-listened',
-          from: userId,
-          voiceMsgId: data.voiceMsgId
-        });
+        send(targetWs, { type: 'voice-listened', from: userId, voiceMsgId: data.voiceMsgId });
         console.log(`[${userId}] → [${target}] voice-listened live`);
       } else {
-        // Отправитель офлайн – сохраняем в Supabase
         const timestamp = Date.now();
-        const expires = timestamp + (14 * 24 * 60 * 60 * 1000); // 14 дней
+        const expires = timestamp + (14 * 24 * 60 * 60 * 1000);
         await supabase.from('offline_queue').insert({
           msg_id: `vl-${timestamp}-${userId}-${target}`,
           recipient_id: target,
@@ -199,7 +159,7 @@ wss.on('connection', (ws) => {
           timestamp: timestamp,
           expires_at: expires
         });
-        console.log(`[${userId}] → [${target}] voice-listened queued in Supabase (offline)`);
+        console.log(`[${userId}] → [${target}] voice-listened queued`);
       }
       return;
     }
@@ -221,8 +181,7 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('error', (e) => console.error('ws error', e.message));
+  ws.on('error', e => console.error('ws error', e.message));
 });
 
-console.log(`🚀 Сервер запущен на порту ${wss.options.port}`);
-console.log(`⏳ Автоудаление офлайн-сообщений через 14 дн.`);
+console.log(`🚀 Server running on port ${wss.options.port}`);
